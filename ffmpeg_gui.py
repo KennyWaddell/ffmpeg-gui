@@ -176,11 +176,21 @@ def probe_video(path: str) -> dict:
         text=True,
         creationflags=flags,
     ).strip()
+    dur_out = subprocess.check_output(
+        [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+        text=True,
+        creationflags=flags,
+    ).strip()
+    try:
+        duration = max(0.1, float(dur_out))
+    except ValueError:
+        duration = 1.0
     return {
         "codec": codec,
         "w": int(w),
         "h": int(h),
         "fps": fps,
+        "duration": duration,
         "has_audio": bool(a_out),
         "audio_codec": a_out,
     }
@@ -340,7 +350,10 @@ class FFmpegGUI:
         self.theme_btn = ttk.Button(btn_frame, text="Modo claro", command=self._toggle_theme)
         self.theme_btn.pack(side=tk.RIGHT, padx=(6, 0))
 
-        ttk.Button(btn_frame, text="Limpiar salida", command=self._clear_log).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="Limpiar salida", command=self._clear_log).pack(side=tk.RIGHT, padx=(6, 0))
+        btn_copy_log = ttk.Button(btn_frame, text="Copiar salida", command=self._copy_log)
+        btn_copy_log.pack(side=tk.RIGHT)
+        _Tooltip(btn_copy_log, "Copia todo el texto de la consola 'Salida en vivo' al portapapeles.")
 
         # --- Consola en vivo ---
         log_frame = ttk.LabelFrame(main, text="Salida en vivo", padding=6)
@@ -384,8 +397,11 @@ class FFmpegGUI:
         self.join_dir = tk.StringVar(value=self.last_output_dir)
         self.join_no_audio = tk.BooleanVar(value=False)
         self.join_out = tk.StringVar(value="unido.mp4")
+        self.join_res = tk.StringVar(value="Auto (mayoría)")
+        self.join_fps = tk.StringVar(value="Auto (mayoría)")
+        self.join_crf = tk.StringVar(value="Auto / Equilibrada (CRF 23)")
 
-        cfg_box = ttk.LabelFrame(self.tab_join, text="1. Carpeta de origen y archivo final", padding=8)
+        cfg_box = ttk.LabelFrame(self.tab_join, text="1. Carpeta de origen, salida y calidad", padding=8)
         cfg_box.pack(fill=tk.X, padx=4, pady=(0, 6))
 
         self._add_path_row(
@@ -407,6 +423,19 @@ class FFmpegGUI:
         chk = ttk.Checkbutton(out_row, text="Sin audio (silenciar todo)", variable=self.join_no_audio, command=update_name)
         chk.pack(side=tk.LEFT, padx=(14, 0))
         _Tooltip(chk, "Elimina todas las pistas de audio del vídeo final.")
+
+        ttk.Label(cfg_box, text="Calidad / Res / FPS:").grid(row=2, column=0, sticky=tk.W, pady=4, padx=(0, 8))
+        q_row = ttk.Frame(cfg_box)
+        q_row.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=4)
+        cb_crf = ttk.Combobox(q_row, textvariable=self.join_crf, state="readonly", width=26, values=["Auto / Equilibrada (CRF 23)", "Alta (CRF 20)", "Ligera (CRF 27)"])
+        cb_crf.pack(side=tk.LEFT)
+        _Tooltip(cb_crf, "En 'Auto', si los vídeos son iguales copia directo; si recodifica usa CRF 23.")
+        cb_res = ttk.Combobox(q_row, textvariable=self.join_res, state="readonly", width=15, values=["Auto (mayoría)", "1080p", "720p", "480p"])
+        cb_res.pack(side=tk.LEFT, padx=8)
+        _Tooltip(cb_res, "Fuerza resolución de salida respetando orientación (vertical u horizontal).")
+        cb_fps = ttk.Combobox(q_row, textvariable=self.join_fps, state="readonly", width=15, values=["Auto (mayoría)", "24", "30", "60"])
+        cb_fps.pack(side=tk.LEFT)
+        _Tooltip(cb_fps, "Fuerza los fotogramas por segundo del vídeo unido.")
 
         list_box = ttk.LabelFrame(self.tab_join, text="2. Vídeos que se unirán (en orden alfabético)", padding=6)
         list_box.pack(fill=tk.BOTH, expand=True, padx=4)
@@ -708,6 +737,13 @@ class FFmpegGUI:
         self.log.delete("1.0", tk.END)
         self.log.configure(state=tk.DISABLED)
 
+    def _copy_log(self) -> None:
+        text = self.log.get("1.0", tk.END).strip()
+        if not text:
+            self.status_var.set("Estado: La consola está vacía")
+            return
+        self._copy_text(text, "Salida en vivo copiada al portapapeles")
+
     def _open_last_dir(self) -> None:
         d = self.last_output_dir
         if os.name == "nt":
@@ -796,6 +832,9 @@ class FFmpegGUI:
         sin_audio = self.join_no_audio.get()
         out_name = self.join_out.get().strip() or ("unido_sin_audio.mp4" if sin_audio else "unido.mp4")
         out_path = os.path.join(carpeta, out_name)
+        res_opt = self.join_res.get()
+        fps_opt = self.join_fps.get()
+        crf_opt = self.join_crf.get()
 
         files = self._list_join_videos(carpeta, out_name)
         if len(files) < 2:
@@ -810,7 +849,10 @@ class FFmpegGUI:
 
         def analyze_and_run() -> None:
             try:
-                cmd, _, temp_list = self._cmd_join(files=files, out_path=out_path, sin_audio=sin_audio, carpeta=carpeta, out_name=out_name)
+                cmd, _, temp_list = self._cmd_join(
+                    files=files, out_path=out_path, sin_audio=sin_audio, carpeta=carpeta,
+                    out_name=out_name, res_opt=res_opt, fps_opt=fps_opt, crf_opt=crf_opt,
+                )
                 if temp_list:
                     self.root.after(0, self.temp_files.append, temp_list)
                 self.root.after(0, self._launch_process, cmd, out_path)
@@ -821,13 +863,26 @@ class FFmpegGUI:
 
         threading.Thread(target=analyze_and_run, daemon=True).start()
 
-    def _cmd_join(self, files: list[str] | None = None, out_path: str | None = None, sin_audio: bool | None = None, carpeta: str | None = None, out_name: str | None = None) -> tuple[list[str], str, str | None]:
+    def _cmd_join(
+        self,
+        files: list[str] | None = None,
+        out_path: str | None = None,
+        sin_audio: bool | None = None,
+        carpeta: str | None = None,
+        out_name: str | None = None,
+        res_opt: str | None = None,
+        fps_opt: str | None = None,
+        crf_opt: str | None = None,
+    ) -> tuple[list[str], str, str | None]:
         carpeta = carpeta or self.join_dir.get().strip()
         if not os.path.isdir(carpeta):
             raise ValueError("Selecciona una carpeta válida.")
         sin_audio = self.join_no_audio.get() if sin_audio is None else sin_audio
         out_name = out_name or self.join_out.get().strip() or ("unido_sin_audio.mp4" if sin_audio else "unido.mp4")
         out_path = out_path or os.path.join(carpeta, out_name)
+        res_opt = res_opt or self.join_res.get()
+        fps_opt = fps_opt or self.join_fps.get()
+        crf_opt = crf_opt or self.join_crf.get()
 
         if files is None:
             files = self._list_join_videos(carpeta, out_name)
@@ -837,10 +892,20 @@ class FFmpegGUI:
         infos = [probe_video(f) for f in files]
         target_w, target_h = Counter((i["w"], i["h"]) for i in infos).most_common(1)[0][0]
         target_fps = Counter(i["fps"] for i in infos).most_common(1)[0][0]
+        force_reencode = ("Auto" not in res_opt) or ("Auto" not in fps_opt) or ("Auto" not in crf_opt)
+
+        if "Auto" not in res_opt:
+            short_side = int(res_opt[:-1])
+            long_side = 1920 if short_side == 1080 else (1280 if short_side == 720 else 854)
+            target_w, target_h = (short_side, long_side) if target_h > target_w else (long_side, short_side)
+        if "Auto" not in fps_opt:
+            target_fps = int(fps_opt)
+        crf = "20" if "20" in crf_opt else ("27" if "27" in crf_opt else "23")
+
         same_video = len({(i["codec"], i["w"], i["h"], i["fps"]) for i in infos}) == 1
         same_audio = sin_audio or (all(i["has_audio"] for i in infos) and len({i["audio_codec"] for i in infos}) == 1)
 
-        if same_video and same_audio:
+        if not force_reencode and same_video and same_audio:
             list_file = os.path.join(carpeta, ".ffmpeg_gui_concat.txt")
             with open(list_file, "w", encoding="utf-8") as fh:
                 for f in files:
@@ -863,15 +928,15 @@ class FFmpegGUI:
                 if info["has_audio"]:
                     filters.append(f"[{idx}:a]aresample=44100:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[a{idx}]")
                 else:
-                    filters.append(f"anullsrc=r=44100:cl=stereo[a{idx}]")
+                    filters.append(f"anullsrc=r=44100:cl=stereo:d={info['duration']:.3f}[a{idx}]")
                 concat_inputs.extend([f"[v{idx}]", f"[a{idx}]"])
 
         if sin_audio:
             filters.append("".join(concat_inputs) + f"concat=n={len(files)}:v=1:a=0[outv]")
-            cmd = [FFMPEG_BIN or "ffmpeg", "-y", *inputs, "-filter_complex", ";".join(filters), "-map", "[outv]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-an", out_path]
+            cmd = [FFMPEG_BIN or "ffmpeg", "-y", *inputs, "-filter_complex", ";".join(filters), "-map", "[outv]", "-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-an", out_path]
         else:
             filters.append("".join(concat_inputs) + f"concat=n={len(files)}:v=1:a=1[outv][outa]")
-            cmd = [FFMPEG_BIN or "ffmpeg", "-y", *inputs, "-filter_complex", ";".join(filters), "-map", "[outv]", "-map", "[outa]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-shortest", out_path]
+            cmd = [FFMPEG_BIN or "ffmpeg", "-y", *inputs, "-filter_complex", ";".join(filters), "-map", "[outv]", "-map", "[outa]", "-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-c:a", "aac", "-b:a", "128k", out_path]
         return cmd, out_path, None
 
     def _cmd_trim(self) -> tuple[list[str], str]:
@@ -1066,10 +1131,11 @@ class FFmpegGUI:
             threading.Timer(2.0, _force_kill).start()
 
     def _stop(self) -> None:
-        if self.process is not None:
+        if self.process is not None and str(self.stop_btn["state"]) != tk.DISABLED:
+            self.stop_btn.configure(state=tk.DISABLED)
             self._terminate_process(self.process, force_wait=False)
             self._append_log("\n[Deteniendo proceso...]\n")
-            self.status_var.set("Estado: Detenido")
+            self.status_var.set("Estado: Deteniendo...")
 
     def _check_version(self) -> None:
         if self.is_busy:
